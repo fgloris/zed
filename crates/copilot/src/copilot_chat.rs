@@ -430,6 +430,7 @@ async fn stream_completion(
         let mut body = Vec::new();
         response.body_mut().read_to_end(&mut body).await?;
         let body_str = std::str::from_utf8(&body)?;
+        print!("body_str: {}",body_str);
         let response: ResponseEvent = serde_json::from_str(body_str)?;
 
         Ok(futures::stream::once(async move { Ok(response) }).boxed())
