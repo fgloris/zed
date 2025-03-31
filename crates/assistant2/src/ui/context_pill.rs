@@ -103,7 +103,7 @@ impl RenderOnce for ContextPill {
             .pl_1()
             .pb(px(1.))
             .border_1()
-            .rounded_md()
+            .rounded_sm()
             .gap_1()
             .child(self.icon().size(IconSize::XSmall).color(Color::Muted));
 
@@ -126,7 +126,13 @@ impl RenderOnce for ContextPill {
                     h_flex()
                         .id("context-data")
                         .gap_1()
-                        .child(Label::new(context.name.clone()).size(LabelSize::Small))
+                        .child(
+                            div().max_w_64().child(
+                                Label::new(context.name.clone())
+                                    .size(LabelSize::Small)
+                                    .truncate(),
+                            ),
+                        )
                         .when_some(context.parent.as_ref(), |element, parent_name| {
                             if *dupe_name {
                                 element.child(
@@ -156,7 +162,9 @@ impl RenderOnce for ContextPill {
                 })
                 .when_some(on_click.as_ref(), |element, on_click| {
                     let on_click = on_click.clone();
-                    element.on_click(move |event, window, cx| on_click(event, window, cx))
+                    element
+                        .cursor_pointer()
+                        .on_click(move |event, window, cx| on_click(event, window, cx))
                 }),
             ContextPill::Suggested {
                 name,
@@ -167,28 +175,34 @@ impl RenderOnce for ContextPill {
             } => base_pill
                 .cursor_pointer()
                 .pr_1()
+                .when(*focused, |this| {
+                    this.bg(color.element_background.opacity(0.5))
+                })
+                .border_dashed()
                 .border_color(if *focused {
                     color.border_focused
                 } else {
-                    color.border_variant.opacity(0.5)
+                    color.border
                 })
                 .hover(|style| style.bg(color.element_hover.opacity(0.5)))
                 .child(
-                    Label::new(name.clone())
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                    div().px_0p5().max_w_64().child(
+                        Label::new(name.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
+                    ),
                 )
                 .child(
-                    div().px_0p5().child(
-                        Label::new(match kind {
-                            ContextKind::File => "Active Tab",
-                            ContextKind::Thread
-                            | ContextKind::Directory
-                            | ContextKind::FetchedUrl => "Active",
-                        })
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                    ),
+                    Label::new(match kind {
+                        ContextKind::File => "Active Tab",
+                        ContextKind::Thread
+                        | ContextKind::Directory
+                        | ContextKind::FetchedUrl
+                        | ContextKind::Symbol => "Active",
+                    })
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
                 )
                 .child(
                     Icon::new(IconName::Plus)

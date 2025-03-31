@@ -2,14 +2,14 @@ mod registrar;
 
 use crate::{
     search_bar::render_nav_button, FocusSearch, NextHistoryQuery, PreviousHistoryQuery, ReplaceAll,
-    ReplaceNext, SearchOptions, SelectAllMatches, SelectNextMatch, SelectPrevMatch,
+    ReplaceNext, SearchOptions, SelectAllMatches, SelectNextMatch, SelectPreviousMatch,
     ToggleCaseSensitive, ToggleRegex, ToggleReplace, ToggleSelection, ToggleWholeWord,
 };
 use any_vec::AnyVec;
 use anyhow::Context as _;
 use collections::HashMap;
 use editor::{
-    actions::{Tab, TabPrev},
+    actions::{Backtab, Tab},
     DisplayPoint, Editor, EditorElement, EditorSettings, EditorStyle,
 };
 use futures::channel::oneshot;
@@ -380,7 +380,7 @@ impl Render for BufferSearchBar {
                                     ui::IconName::ChevronLeft,
                                     self.active_match_index.is_some(),
                                     "Select Previous Match",
-                                    &SelectPrevMatch,
+                                    &SelectPreviousMatch,
                                     focus_handle.clone(),
                                 ))
                                 .child(render_nav_button(
@@ -477,7 +477,7 @@ impl Render for BufferSearchBar {
             .track_scroll(&self.scroll_handle)
             .key_context(key_context)
             .capture_action(cx.listener(Self::tab))
-            .capture_action(cx.listener(Self::tab_prev))
+            .capture_action(cx.listener(Self::backtab))
             .on_action(cx.listener(Self::previous_history_query))
             .on_action(cx.listener(Self::next_history_query))
             .on_action(cx.listener(Self::dismiss))
@@ -625,13 +625,15 @@ impl BufferSearchBar {
                 this.select_next_match(action, window, cx);
             }
         }));
-        registrar.register_handler(WithResults(|this, action: &SelectPrevMatch, window, cx| {
-            if this.supported_options(cx).find_in_results {
-                cx.propagate();
-            } else {
-                this.select_prev_match(action, window, cx);
-            }
-        }));
+        registrar.register_handler(WithResults(
+            |this, action: &SelectPreviousMatch, window, cx| {
+                if this.supported_options(cx).find_in_results {
+                    cx.propagate();
+                } else {
+                    this.select_prev_match(action, window, cx);
+                }
+            },
+        ));
         registrar.register_handler(WithResults(
             |this, action: &SelectAllMatches, window, cx| {
                 if this.supported_options(cx).find_in_results {
@@ -691,13 +693,13 @@ impl BufferSearchBar {
                 query_buffer.set_language_registry(languages.clone());
             });
 
-            cx.spawn(|buffer_search_bar, mut cx| async move {
+            cx.spawn(async move |buffer_search_bar, cx| {
                 let regex_language = languages
                     .language_for_name("regex")
                     .await
                     .context("loading regex language")?;
                 buffer_search_bar
-                    .update(&mut cx, |buffer_search_bar, cx| {
+                    .update(cx, |buffer_search_bar, cx| {
                         buffer_search_bar.regex_language = Some(regex_language);
                         buffer_search_bar.adjust_query_regex_language(cx);
                     })
@@ -846,9 +848,9 @@ impl BufferSearchBar {
             .map(|suggestion| self.search(&suggestion, Some(self.default_options), window, cx));
 
         if let Some(search) = search {
-            cx.spawn_in(window, |this, mut cx| async move {
+            cx.spawn_in(window, async move |this, cx| {
                 search.await?;
-                this.update_in(&mut cx, |this, window, cx| {
+                this.update_in(cx, |this, window, cx| {
                     this.activate_current_match(window, cx)
                 })
             })
@@ -996,7 +998,7 @@ impl BufferSearchBar {
 
     fn select_prev_match(
         &mut self,
-        _: &SelectPrevMatch,
+        _: &SelectPreviousMatch,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1095,9 +1097,9 @@ impl BufferSearchBar {
                 self.editor_needed_width = width;
                 cx.notify();
 
-                cx.spawn_in(window, |this, mut cx| async move {
+                cx.spawn_in(window, async move |this, cx| {
                     search.await?;
-                    this.update_in(&mut cx, |this, window, cx| {
+                    this.update_in(cx, |this, window, cx| {
                         this.activate_current_match(window, cx)
                     })
                 })
@@ -1269,10 +1271,10 @@ impl BufferSearchBar {
                 let matches = active_searchable_item.find_matches(query, window, cx);
 
                 let active_searchable_item = active_searchable_item.downgrade();
-                self.pending_search = Some(cx.spawn_in(window, |this, mut cx| async move {
+                self.pending_search = Some(cx.spawn_in(window, async move |this, cx| {
                     let matches = matches.await;
 
-                    this.update_in(&mut cx, |this, window, cx| {
+                    this.update_in(cx, |this, window, cx| {
                         if let Some(active_searchable_item) =
                             WeakSearchableItemHandle::upgrade(active_searchable_item.as_ref(), cx)
                         {
@@ -1304,7 +1306,16 @@ impl BufferSearchBar {
         done_rx
     }
 
+    fn reverse_direction_if_backwards(&self, direction: Direction) -> Direction {
+        if self.search_options.contains(SearchOptions::BACKWARDS) {
+            direction.opposite()
+        } else {
+            direction
+        }
+    }
+
     pub fn update_match_index(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let direction = self.reverse_direction_if_backwards(Direction::Next);
         let new_index = self
             .active_searchable_item
             .as_ref()
@@ -1312,7 +1323,7 @@ impl BufferSearchBar {
                 let matches = self
                     .searchable_items_with_matches
                     .get(&searchable_item.downgrade())?;
-                searchable_item.active_match_index(matches, window, cx)
+                searchable_item.active_match_index(direction, matches, window, cx)
             });
         if new_index != self.active_match_index {
             self.active_match_index = new_index;
@@ -1333,7 +1344,7 @@ impl BufferSearchBar {
         cx.stop_propagation();
     }
 
-    fn tab_prev(&mut self, _: &TabPrev, window: &mut Window, cx: &mut Context<Self>) {
+    fn backtab(&mut self, _: &Backtab, window: &mut Window, cx: &mut Context<Self>) {
         // Search -> Replace -> Search
         let focus_handle = if self.replace_enabled && self.query_editor_focused {
             self.replacement_editor.focus_handle(cx)
@@ -1699,7 +1710,7 @@ mod tests {
         });
 
         search_bar.update_in(cx, |search_bar, window, cx| {
-            search_bar.select_prev_match(&SelectPrevMatch, window, cx);
+            search_bar.select_prev_match(&SelectPreviousMatch, window, cx);
             assert_eq!(
                 editor.update(cx, |editor, cx| editor.selections.display_ranges(cx)),
                 [DisplayPoint::new(DisplayRow(3), 56)..DisplayPoint::new(DisplayRow(3), 58)]
@@ -1710,7 +1721,7 @@ mod tests {
         });
 
         search_bar.update_in(cx, |search_bar, window, cx| {
-            search_bar.select_prev_match(&SelectPrevMatch, window, cx);
+            search_bar.select_prev_match(&SelectPreviousMatch, window, cx);
             assert_eq!(
                 editor.update(cx, |editor, cx| editor.selections.display_ranges(cx)),
                 [DisplayPoint::new(DisplayRow(3), 11)..DisplayPoint::new(DisplayRow(3), 13)]
@@ -1721,7 +1732,7 @@ mod tests {
         });
 
         search_bar.update_in(cx, |search_bar, window, cx| {
-            search_bar.select_prev_match(&SelectPrevMatch, window, cx);
+            search_bar.select_prev_match(&SelectPreviousMatch, window, cx);
             assert_eq!(
                 editor.update(cx, |editor, cx| editor.selections.display_ranges(cx)),
                 [DisplayPoint::new(DisplayRow(0), 41)..DisplayPoint::new(DisplayRow(0), 43)]
@@ -1742,7 +1753,7 @@ mod tests {
         });
         search_bar.update_in(cx, |search_bar, window, cx| {
             assert_eq!(search_bar.active_match_index, Some(1));
-            search_bar.select_prev_match(&SelectPrevMatch, window, cx);
+            search_bar.select_prev_match(&SelectPreviousMatch, window, cx);
             assert_eq!(
                 editor.update(cx, |editor, cx| editor.selections.display_ranges(cx)),
                 [DisplayPoint::new(DisplayRow(0), 41)..DisplayPoint::new(DisplayRow(0), 43)]
@@ -1784,7 +1795,7 @@ mod tests {
         });
         search_bar.update_in(cx, |search_bar, window, cx| {
             assert_eq!(search_bar.active_match_index, Some(2));
-            search_bar.select_prev_match(&SelectPrevMatch, window, cx);
+            search_bar.select_prev_match(&SelectPreviousMatch, window, cx);
             assert_eq!(
                 editor.update(cx, |editor, cx| editor.selections.display_ranges(cx)),
                 [DisplayPoint::new(DisplayRow(3), 56)..DisplayPoint::new(DisplayRow(3), 58)]
@@ -1826,7 +1837,7 @@ mod tests {
         });
         search_bar.update_in(cx, |search_bar, window, cx| {
             assert_eq!(search_bar.active_match_index, Some(0));
-            search_bar.select_prev_match(&SelectPrevMatch, window, cx);
+            search_bar.select_prev_match(&SelectPreviousMatch, window, cx);
             assert_eq!(
                 editor.update(cx, |editor, cx| editor.selections.display_ranges(cx)),
                 [DisplayPoint::new(DisplayRow(3), 56)..DisplayPoint::new(DisplayRow(3), 58)]
@@ -2039,7 +2050,7 @@ mod tests {
                     );
                 });
                 search_bar.update(cx, |search_bar, cx| {
-                    search_bar.select_prev_match(&SelectPrevMatch, window, cx);
+                    search_bar.select_prev_match(&SelectPreviousMatch, window, cx);
                 });
             })
             .unwrap();
@@ -2047,7 +2058,7 @@ mod tests {
             .update(cx, |_, window, cx| {
                 assert!(
                     editor.read(cx).is_focused(window),
-                    "Should still have editor focused after SelectPrevMatch"
+                    "Should still have editor focused after SelectPreviousMatch"
                 );
 
                 search_bar.update(cx, |search_bar, cx| {
@@ -2667,7 +2678,7 @@ mod tests {
                 ],
                 cx,
             );
-            Editor::for_multibuffer(multibuffer, None, false, window, cx)
+            Editor::for_multibuffer(multibuffer, None, window, cx)
         });
 
         let search_bar = cx.new_window_entity(|window, cx| {

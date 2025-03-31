@@ -1,6 +1,7 @@
 use crate::persistence::model::DockData;
 use crate::{status_bar::StatusItemView, Workspace};
-use crate::{DraggedDock, Event, Pane};
+use crate::{DraggedDock, Event, ModalLayer, Pane};
+use anyhow::Context as _;
 use client::proto;
 use gpui::{
     deferred, div, px, Action, AnyView, App, Axis, Context, Corner, Entity, EntityId, EventEmitter,
@@ -53,6 +54,9 @@ pub trait Panel: Focusable + EventEmitter<PanelEvent> + Render + Sized {
         None
     }
     fn activation_priority(&self) -> u32;
+    fn enabled(&self, _cx: &App) -> bool {
+        true
+    }
 }
 
 pub trait PanelHandle: Send + Sync {
@@ -75,6 +79,7 @@ pub trait PanelHandle: Send + Sync {
     fn panel_focus_handle(&self, cx: &App) -> FocusHandle;
     fn to_any(&self) -> AnyView;
     fn activation_priority(&self, cx: &App) -> u32;
+    fn enabled(&self, cx: &App) -> bool;
     fn move_to_next_position(&self, window: &mut Window, cx: &mut App) {
         let current_position = self.position(window, cx);
         let next_position = [
@@ -171,6 +176,10 @@ where
     fn activation_priority(&self, cx: &App) -> u32 {
         self.read(cx).activation_priority()
     }
+
+    fn enabled(&self, cx: &App) -> bool {
+        self.read(cx).enabled(cx)
+    }
 }
 
 impl From<&dyn PanelHandle> for AnyView {
@@ -189,7 +198,8 @@ pub struct Dock {
     active_panel_index: Option<usize>,
     focus_handle: FocusHandle,
     pub(crate) serialized_dock: Option<DockData>,
-    resizeable: bool,
+    zoom_layer_open: bool,
+    modal_layer: Entity<ModalLayer>,
     _subscriptions: [Subscription; 2],
 }
 
@@ -236,6 +246,7 @@ pub struct PanelButtons {
 impl Dock {
     pub fn new(
         position: DockPosition,
+        modal_layer: Entity<ModalLayer>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
@@ -251,7 +262,7 @@ impl Dock {
             let zoom_subscription = cx.subscribe(&workspace, |dock, workspace, e: &Event, cx| {
                 if matches!(e, Event::ZoomChanged) {
                     let is_zoomed = workspace.read(cx).zoomed.is_some();
-                    dock.resizeable = !is_zoomed;
+                    dock.zoom_layer_open = is_zoomed;
                 }
             });
             Self {
@@ -263,7 +274,8 @@ impl Dock {
                 focus_handle: focus_handle.clone(),
                 _subscriptions: [focus_subscription, zoom_subscription],
                 serialized_dock: None,
-                resizeable: true,
+                zoom_layer_open: false,
+                modal_layer,
             }
         });
 
@@ -320,6 +332,10 @@ impl Dock {
         self.is_open
     }
 
+    fn resizable(&self, cx: &App) -> bool {
+        !(self.zoom_layer_open || self.modal_layer.read(cx).has_active_modal())
+    }
+
     pub fn panel<T: Panel>(&self) -> Option<Entity<T>> {
         self.panel_entries
             .iter()
@@ -342,6 +358,18 @@ impl Dock {
         self.panel_entries
             .iter()
             .position(|entry| entry.panel.remote_id() == Some(panel_id))
+    }
+
+    pub fn first_enabled_panel_idx(&mut self, cx: &mut Context<Self>) -> anyhow::Result<usize> {
+        self.panel_entries
+            .iter()
+            .position(|entry| entry.panel.enabled(cx))
+            .with_context(|| {
+                format!(
+                    "Couldn't find any enabled panel for the {} dock.",
+                    self.position.label()
+                )
+            })
     }
 
     fn active_panel_entry(&self) -> Option<&PanelEntry> {
@@ -777,7 +805,9 @@ impl Render for Dock {
                                 .cached(StyleRefinement::default().v_flex().size_full()),
                         ),
                 )
-                .when(self.resizeable, |this| this.child(create_resize_handle()))
+                .when(self.resizable(cx), |this| {
+                    this.child(create_resize_handle())
+                })
         } else {
             div()
                 .key_context(dispatch_context)

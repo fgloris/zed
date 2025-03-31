@@ -1,6 +1,6 @@
 //! This module contains all actions supported by [`Editor`].
 use super::*;
-use gpui::{action_as, action_with_deprecated_aliases};
+use gpui::{action_as, action_with_deprecated_aliases, actions};
 use schemars::JsonSchema;
 use util::serde::default_true;
 #[derive(PartialEq, Clone, Deserialize, Default, JsonSchema)]
@@ -197,20 +197,6 @@ pub struct DeleteToPreviousWordStart {
 }
 
 #[derive(PartialEq, Clone, Deserialize, Default, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct GoToHunk {
-    #[serde(default)]
-    pub center_cursor: bool,
-}
-
-#[derive(PartialEq, Clone, Deserialize, Default, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct GoToPrevHunk {
-    #[serde(default)]
-    pub center_cursor: bool,
-}
-
-#[derive(PartialEq, Clone, Deserialize, Default, JsonSchema)]
 pub struct FoldAtLevel(pub u32);
 
 #[derive(PartialEq, Clone, Deserialize, Default, JsonSchema)]
@@ -240,8 +226,6 @@ impl_actions!(
         ExpandExcerptsDown,
         ExpandExcerptsUp,
         FoldAt,
-        GoToHunk,
-        GoToPrevHunk,
         HandleInput,
         MoveDownByLines,
         MovePageDown,
@@ -264,7 +248,7 @@ impl_actions!(
     ]
 );
 
-gpui::actions!(
+actions!(
     editor,
     [
         AcceptEditPrediction,
@@ -281,7 +265,7 @@ gpui::actions!(
         ContextMenuFirst,
         ContextMenuLast,
         ContextMenuNext,
-        ContextMenuPrev,
+        ContextMenuPrevious,
         ConvertToKebabCase,
         ConvertToLowerCamelCase,
         ConvertToLowerCase,
@@ -291,6 +275,7 @@ gpui::actions!(
         ConvertToUpperCamelCase,
         ConvertToUpperCase,
         Copy,
+        CopyAndTrim,
         CopyFileLocation,
         CopyHighlightJson,
         CopyFileName,
@@ -323,9 +308,11 @@ gpui::actions!(
         GoToDefinition,
         GoToDefinitionSplit,
         GoToDiagnostic,
+        GoToHunk,
+        GoToPreviousHunk,
         GoToImplementation,
         GoToImplementationSplit,
-        GoToPrevDiagnostic,
+        GoToPreviousDiagnostic,
         GoToTypeDefinition,
         GoToTypeDefinitionSplit,
         HalfPageDown,
@@ -354,7 +341,9 @@ gpui::actions!(
         MoveToPreviousWordStart,
         MoveToStartOfParagraph,
         MoveToStartOfExcerpt,
+        MoveToStartOfNextExcerpt,
         MoveToEndOfExcerpt,
+        MoveToEndOfPreviousExcerpt,
         MoveUp,
         Newline,
         NewlineAbove,
@@ -392,7 +381,9 @@ gpui::actions!(
         SelectAll,
         SelectAllMatches,
         SelectToStartOfExcerpt,
+        SelectToStartOfNextExcerpt,
         SelectToEndOfExcerpt,
+        SelectToEndOfPreviousExcerpt,
         SelectDown,
         SelectEnclosingSymbol,
         SelectLargerSyntaxNode,
@@ -414,15 +405,19 @@ gpui::actions!(
         ShowCharacterPalette,
         ShowEditPrediction,
         ShowSignatureHelp,
+        ShowWordCompletions,
         ShuffleLines,
         SortLinesCaseInsensitive,
         SortLinesCaseSensitive,
         SplitSelectionIntoLines,
         SwitchSourceHeader,
         Tab,
-        TabPrev,
+        Backtab,
+        ToggleBreakpoint,
+        DisableBreakpoint,
+        EnableBreakpoint,
+        EditLogBreakpoint,
         ToggleAutoSignatureHelp,
-        ToggleGitBlame,
         ToggleGitBlameInline,
         ToggleIndentGuides,
         ToggleInlayHints,

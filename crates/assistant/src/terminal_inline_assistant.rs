@@ -19,7 +19,7 @@ use language_model::{
     report_assistant_event, LanguageModelRegistry, LanguageModelRequest,
     LanguageModelRequestMessage, Role,
 };
-use language_model_selector::{InlineLanguageModelSelector, LanguageModelSelector};
+use language_model_selector::{LanguageModelSelector, LanguageModelSelectorPopoverMenu};
 use prompt_store::PromptBuilder;
 use settings::{update_settings_file, Settings};
 use std::{
@@ -506,7 +506,7 @@ struct PromptEditor {
 impl EventEmitter<PromptEditorEvent> for PromptEditor {}
 
 impl Render for PromptEditor {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let status = &self.codegen.read(cx).status;
         let buttons = match status {
             CodegenStatus::Idle => {
@@ -641,10 +641,29 @@ impl Render for PromptEditor {
                     .w_12()
                     .justify_center()
                     .gap_2()
-                    .child(
-                        InlineLanguageModelSelector::new(self.language_model_selector.clone())
-                            .render(window, cx),
-                    )
+                    .child(LanguageModelSelectorPopoverMenu::new(
+                        self.language_model_selector.clone(),
+                        IconButton::new("change-model", IconName::SettingsAlt)
+                            .shape(IconButtonShape::Square)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted),
+                        move |window, cx| {
+                            Tooltip::with_meta(
+                                format!(
+                                    "Using {}",
+                                    LanguageModelRegistry::read_global(cx)
+                                        .active_model()
+                                        .map(|model| model.name().0)
+                                        .unwrap_or_else(|| "No model selected".into()),
+                                ),
+                                None,
+                                "Change Model",
+                                window,
+                                cx,
+                            )
+                        },
+                        gpui::Corner::TopRight,
+                    ))
                     .children(
                         if let CodegenStatus::Error(error) = &self.codegen.read(cx).status {
                             let error_message = SharedString::from(error.to_string());
@@ -683,7 +702,6 @@ impl Focusable for PromptEditor {
 impl PromptEditor {
     const MAX_LINES: u8 = 8;
 
-    #[allow(clippy::too_many_arguments)]
     fn new(
         id: TerminalInlineAssistId,
         prompt_history: VecDeque<String>,
@@ -702,7 +720,6 @@ impl PromptEditor {
                 },
                 prompt_buffer,
                 None,
-                false,
                 window,
                 cx,
             );
@@ -808,7 +825,7 @@ impl PromptEditor {
         let Some(model) = LanguageModelRegistry::read_global(cx).active_model() else {
             return;
         };
-        self.pending_token_count = cx.spawn(|this, mut cx| async move {
+        self.pending_token_count = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_secs(1)).await;
             let request =
                 cx.update_global(|inline_assistant: &mut TerminalInlineAssistant, cx| {
@@ -816,7 +833,7 @@ impl PromptEditor {
                 })??;
 
             let token_count = cx.update(|cx| model.count_tokens(request, cx))?.await?;
-            this.update(&mut cx, |this, cx| {
+            this.update(cx, |this, cx| {
                 this.token_count = Some(token_count);
                 cx.notify();
             })
@@ -1123,7 +1140,7 @@ impl Codegen {
         let telemetry = self.telemetry.clone();
         self.status = CodegenStatus::Pending;
         self.transaction = Some(TerminalTransaction::start(self.terminal.clone()));
-        self.generation = cx.spawn(|this, mut cx| async move {
+        self.generation = cx.spawn(async move |this, cx| {
             let model_telemetry_id = model.telemetry_id();
             let model_provider_id = model.provider_id();
             let response = model.stream_completion_text(prompt, &cx).await;
@@ -1180,12 +1197,12 @@ impl Codegen {
                     }
                 });
 
-                this.update(&mut cx, |this, _| {
+                this.update(cx, |this, _| {
                     this.message_id = message_id;
                 })?;
 
                 while let Some(hunk) = hunks_rx.next().await {
-                    this.update(&mut cx, |this, cx| {
+                    this.update(cx, |this, cx| {
                         if let Some(transaction) = &mut this.transaction {
                             transaction.push(hunk, cx);
                             cx.notify();
@@ -1199,7 +1216,7 @@ impl Codegen {
 
             let result = generate.await;
 
-            this.update(&mut cx, |this, cx| {
+            this.update(cx, |this, cx| {
                 if let Err(error) = result {
                     this.status = CodegenStatus::Error(error);
                 } else {

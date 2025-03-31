@@ -1,14 +1,16 @@
 use crate::{
     item::{
         ActivateOnClose, ClosePosition, Item, ItemHandle, ItemSettings, PreviewTabsSettings,
-        ShowDiagnostics, TabContentParams, TabTooltipContent, WeakItemHandle,
+        ProjectItemKind, ShowCloseButton, ShowDiagnostics, TabContentParams, TabTooltipContent,
+        WeakItemHandle,
     },
     move_item,
     notifications::NotifyResultExt,
     toolbar::Toolbar,
     workspace_settings::{AutosaveSetting, TabBarSettings, WorkspaceSettings},
-    CloseWindow, NewFile, NewTerminal, OpenInTerminal, OpenTerminal, OpenVisible, SplitDirection,
-    ToggleFileFinder, ToggleProjectSymbols, ToggleZoom, Workspace,
+    CloseWindow, NewFile, NewTerminal, OpenInTerminal, OpenOptions, OpenTerminal, OpenVisible,
+    SplitDirection, ToggleFileFinder, ToggleProjectSymbols, ToggleZoom, Workspace,
+    WorkspaceItemBuilder,
 };
 use anyhow::Result;
 use collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -172,7 +174,7 @@ impl_actions!(
 actions!(
     pane,
     [
-        ActivatePrevItem,
+        ActivatePreviousItem,
         ActivateNextItem,
         ActivateLastItem,
         AlternateFile,
@@ -219,7 +221,7 @@ pub enum Event {
         idx: usize,
     },
     RemovedItem {
-        item_id: EntityId,
+        item: Box<dyn ItemHandle>,
     },
     Split(SplitDirection),
     JoinAll,
@@ -247,9 +249,9 @@ impl fmt::Debug for Event {
                 .finish(),
             Event::Remove { .. } => f.write_str("Remove"),
             Event::RemoveItem { idx } => f.debug_struct("RemoveItem").field("idx", idx).finish(),
-            Event::RemovedItem { item_id } => f
+            Event::RemovedItem { item } => f
                 .debug_struct("RemovedItem")
-                .field("item_id", item_id)
+                .field("item", &item.item_id())
                 .finish(),
             Event::Split(direction) => f
                 .debug_struct("Split")
@@ -315,11 +317,14 @@ pub struct Pane {
     display_nav_history_buttons: Option<bool>,
     double_click_dispatch_action: Box<dyn Action>,
     save_modals_spawned: HashSet<EntityId>,
+    close_pane_if_empty: bool,
     pub new_item_context_menu_handle: PopoverMenuHandle<ContextMenu>,
     pub split_item_context_menu_handle: PopoverMenuHandle<ContextMenu>,
     pinned_tab_count: usize,
     diagnostics: HashMap<ProjectPath, DiagnosticSeverity>,
     zoom_out_on_close: bool,
+    /// If a certain project item wants to get recreated with specific data, it can persist its data before the recreation here.
+    pub project_item_restoration_data: HashMap<ProjectItemKind, Box<dyn Any + Send>>,
 }
 
 pub struct ActivationHistoryEntry {
@@ -519,11 +524,13 @@ impl Pane {
             _subscriptions: subscriptions,
             double_click_dispatch_action,
             save_modals_spawned: HashSet::default(),
+            close_pane_if_empty: true,
             split_item_context_menu_handle: Default::default(),
             new_item_context_menu_handle: Default::default(),
             pinned_tab_count: 0,
             diagnostics: Default::default(),
             zoom_out_on_close: true,
+            project_item_restoration_data: HashMap::default(),
         }
     }
 
@@ -706,6 +713,11 @@ impl Pane {
         self.can_split_predicate = can_split_predicate;
     }
 
+    pub fn set_close_pane_if_empty(&mut self, close_pane_if_empty: bool, cx: &mut Context<Self>) {
+        self.close_pane_if_empty = close_pane_if_empty;
+        cx.notify();
+    }
+
     pub fn set_can_navigate(&mut self, can_navigate: bool, cx: &mut Context<Self>) {
         self.toolbar.update(cx, |toolbar, cx| {
             toolbar.set_can_navigate(can_navigate, cx);
@@ -805,7 +817,7 @@ impl Pane {
             .cloned()
     }
 
-    fn preview_item_idx(&self) -> Option<usize> {
+    pub fn preview_item_idx(&self) -> Option<usize> {
         if let Some(preview_item_id) = self.preview_item_id {
             self.items
                 .iter()
@@ -843,7 +855,6 @@ impl Pane {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_item(
         &mut self,
         project_entry_id: Option<ProjectEntryId>,
@@ -853,7 +864,7 @@ impl Pane {
         suggested_position: Option<usize>,
         window: &mut Window,
         cx: &mut Context<Self>,
-        build_item: impl FnOnce(&mut Window, &mut Context<Pane>) -> Box<dyn ItemHandle>,
+        build_item: WorkspaceItemBuilder,
     ) -> Box<dyn ItemHandle> {
         let mut existing_item = None;
         if let Some(project_entry_id) = project_entry_id {
@@ -890,7 +901,7 @@ impl Pane {
                 suggested_position
             };
 
-            let new_item = build_item(window, cx);
+            let new_item = build_item(self, window, cx);
 
             if allow_preview {
                 self.set_preview_item_id(Some(new_item.item_id()), cx);
@@ -928,7 +939,6 @@ impl Pane {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn add_item_inner(
         &mut self,
         item: Box<dyn ItemHandle>,
@@ -1577,8 +1587,8 @@ impl Pane {
         let Some(project) = self.project.upgrade() else {
             return Task::ready(Ok(()));
         };
-        cx.spawn_in(window, |pane, mut cx| async move {
-            let dirty_items = workspace.update(&mut cx, |workspace, cx| {
+        cx.spawn_in(window, async move |pane, cx| {
+            let dirty_items = workspace.update(cx, |workspace, cx| {
                 items_to_close
                     .iter()
                     .filter(|item| {
@@ -1590,7 +1600,7 @@ impl Pane {
             })?;
 
             if save_intent == SaveIntent::Close && dirty_items.len() > 1 {
-                let answer = pane.update_in(&mut cx, |_, window, cx| {
+                let answer = pane.update_in(cx, |_, window, cx| {
                     let detail = Self::file_names_for_prompt(&mut dirty_items.iter(), cx);
                     window.prompt(
                         PromptLevel::Warning,
@@ -1611,7 +1621,7 @@ impl Pane {
             for item_to_close in items_to_close {
                 let mut should_save = true;
                 if save_intent == SaveIntent::Close {
-                    workspace.update(&mut cx, |workspace, cx| {
+                    workspace.update(cx, |workspace, cx| {
                         if Self::skip_save_on_close(item_to_close.as_ref(), &workspace, cx) {
                             should_save = false;
                         }
@@ -1619,27 +1629,28 @@ impl Pane {
                 }
 
                 if should_save {
-                    if !Self::save_item(
-                        project.clone(),
-                        &pane,
-                        &*item_to_close,
-                        save_intent,
-                        &mut cx,
-                    )
-                    .await?
+                    if !Self::save_item(project.clone(), &pane, &*item_to_close, save_intent, cx)
+                        .await?
                     {
                         break;
                     }
                 }
 
                 // Remove the item from the pane.
-                pane.update_in(&mut cx, |pane, window, cx| {
+                pane.update_in(cx, |pane, window, cx| {
+                    pane.remove_item(
+                        item_to_close.item_id(),
+                        false,
+                        pane.close_pane_if_empty,
+                        window,
+                        cx,
+                    );
                     pane.remove_item(item_to_close.item_id(), false, true, window, cx);
                 })
                 .ok();
             }
 
-            pane.update(&mut cx, |_, cx| cx.notify()).ok();
+            pane.update(cx, |_, cx| cx.notify()).ok();
             Ok(())
         })
     }
@@ -1741,13 +1752,9 @@ impl Pane {
             }
         }
 
-        cx.emit(Event::RemoveItem { idx: item_index });
-
         let item = self.items.remove(item_index);
 
-        cx.emit(Event::RemovedItem {
-            item_id: item.item_id(),
-        });
+        cx.emit(Event::RemovedItem { item: item.clone() });
         if self.items.is_empty() {
             item.deactivated(window, cx);
             if close_pane_if_empty {
@@ -1880,7 +1887,7 @@ impl Pane {
                     }
                     Ok(1) => {
                         pane.update_in(cx, |pane, window, cx| {
-                            pane.remove_item(item.item_id(), false, false, window, cx)
+                            pane.remove_item(item.item_id(), false, true, window, cx)
                         })?;
                     }
                     _ => return Ok(false),
@@ -2269,7 +2276,7 @@ impl Pane {
 
         let settings = ItemSettings::get_global(cx);
         let close_side = &settings.close_position;
-        let always_show_close_button = settings.always_show_close_button;
+        let show_close_button = &settings.show_close_button;
         let indicator = render_item_indicator(item.boxed_clone(), cx);
         let item_id = item.item_id();
         let is_first_item = ix == 0;
@@ -2373,18 +2380,21 @@ impl Pane {
                         close_pinned: false,
                     };
                     end_slot_tooltip_text = "Close Tab";
-                    IconButton::new("close tab", IconName::Close)
-                        .when(!always_show_close_button, |button| {
-                            button.visible_on_hover("")
-                        })
-                        .shape(IconButtonShape::Square)
-                        .icon_color(Color::Muted)
-                        .size(ButtonSize::None)
-                        .icon_size(IconSize::XSmall)
-                        .on_click(cx.listener(move |pane, _, window, cx| {
-                            pane.close_item_by_id(item_id, SaveIntent::Close, window, cx)
-                                .detach_and_log_err(cx);
-                        }))
+                    match show_close_button {
+                        ShowCloseButton::Always => IconButton::new("close tab", IconName::Close),
+                        ShowCloseButton::Hover => {
+                            IconButton::new("close tab", IconName::Close).visible_on_hover("")
+                        }
+                        ShowCloseButton::Hidden => return this,
+                    }
+                    .shape(IconButtonShape::Square)
+                    .icon_color(Color::Muted)
+                    .size(ButtonSize::None)
+                    .icon_size(IconSize::XSmall)
+                    .on_click(cx.listener(move |pane, _, window, cx| {
+                        pane.close_item_by_id(item_id, SaveIntent::Close, window, cx)
+                            .detach_and_log_err(cx);
+                    }))
                 }
                 .map(|this| {
                     if is_active {
@@ -2421,14 +2431,10 @@ impl Pane {
                     .child(label),
             );
 
-        let single_entry_to_resolve = {
-            let item_entries = self.items[ix].project_entry_ids(cx);
-            if item_entries.len() == 1 {
-                Some(item_entries[0])
-            } else {
-                None
-            }
-        };
+        let single_entry_to_resolve = self.items[ix]
+            .is_singleton(cx)
+            .then(|| self.items[ix].project_entry_ids(cx).get(0).copied())
+            .flatten();
 
         let total_items = self.items.len();
         let has_items_to_left = ix > 0;
@@ -2782,7 +2788,7 @@ impl Pane {
                                     window.dispatch_action(
                                         this.double_click_dispatch_action.boxed_clone(),
                                         cx,
-                                    )
+                                    );
                                 }
                             })),
                     ),
@@ -2973,12 +2979,12 @@ impl Pane {
                         .path_for_entry(project_entry_id, cx)
                     {
                         let load_path_task = workspace.load_path(path, window, cx);
-                        cx.spawn_in(window, |workspace, mut cx| async move {
+                        cx.spawn_in(window, async move |workspace, cx| {
                             if let Some((project_entry_id, build_item)) =
-                                load_path_task.await.notify_async_err(&mut cx)
+                                load_path_task.await.notify_async_err(cx)
                             {
                                 let (to_pane, new_item_handle) = workspace
-                                    .update_in(&mut cx, |workspace, window, cx| {
+                                    .update_in(cx, |workspace, window, cx| {
                                         if let Some(split_direction) = split_direction {
                                             to_pane = workspace.split_pane(
                                                 to_pane,
@@ -3003,7 +3009,7 @@ impl Pane {
                                     })
                                     .log_err()?;
                                 to_pane
-                                    .update_in(&mut cx, |this, window, cx| {
+                                    .update_in(cx, |this, window, cx| {
                                         let Some(index) = this.index_for_item(&*new_item_handle)
                                         else {
                                             return;
@@ -3060,7 +3066,7 @@ impl Pane {
         self.workspace
             .update(cx, |workspace, cx| {
                 let fs = Arc::clone(workspace.project().read(cx).fs());
-                cx.spawn_in(window, |workspace, mut cx| async move {
+                cx.spawn_in(window, async move |workspace, cx| {
                     let mut is_file_checks = FuturesUnordered::new();
                     for path in &paths {
                         is_file_checks.push(fs.is_file(path))
@@ -3077,20 +3083,23 @@ impl Pane {
                         split_direction = None;
                     }
 
-                    if let Ok(open_task) = workspace.update_in(&mut cx, |workspace, window, cx| {
+                    if let Ok(open_task) = workspace.update_in(cx, |workspace, window, cx| {
                         if let Some(split_direction) = split_direction {
                             to_pane = workspace.split_pane(to_pane, split_direction, window, cx);
                         }
                         workspace.open_paths(
                             paths,
-                            OpenVisible::OnlyDirectories,
+                            OpenOptions {
+                                visible: Some(OpenVisible::OnlyDirectories),
+                                ..Default::default()
+                            },
                             Some(to_pane.downgrade()),
                             window,
                             cx,
                         )
                     }) {
                         let opened_items: Vec<_> = open_task.await;
-                        _ = workspace.update(&mut cx, |workspace, cx| {
+                        _ = workspace.update(cx, |workspace, cx| {
                             for item in opened_items.into_iter().flatten() {
                                 if let Err(e) = item {
                                     workspace.show_error(&e, cx);
@@ -3200,7 +3209,7 @@ impl Render for Pane {
                 }),
             )
             .on_action(
-                cx.listener(|pane: &mut Pane, _: &ActivatePrevItem, window, cx| {
+                cx.listener(|pane: &mut Pane, _: &ActivatePreviousItem, window, cx| {
                     pane.activate_prev_item(true, window, cx);
                 }),
             )
@@ -3297,7 +3306,7 @@ impl Render for Pane {
                 pane.child(self.render_tab_bar(window, cx))
             })
             .child({
-                let has_worktrees = project.read(cx).worktrees(cx).next().is_some();
+                let has_worktrees = project.read(cx).visible_worktrees(cx).next().is_some();
                 // main content
                 div()
                     .flex_1()
@@ -3311,13 +3320,28 @@ impl Render for Pane {
                     })
                     .map(|div| {
                         if let Some(item) = self.active_item() {
-                            div.v_flex()
+                            div.id("pane_placeholder")
+                                .v_flex()
                                 .size_full()
                                 .overflow_hidden()
                                 .child(self.toolbar.clone())
                                 .child(item.to_any())
                         } else {
-                            let placeholder = div.h_flex().size_full().justify_center();
+                            let placeholder = div
+                                .id("pane_placeholder")
+                                .h_flex()
+                                .size_full()
+                                .justify_center()
+                                .on_click(cx.listener(
+                                    move |this, event: &ClickEvent, window, cx| {
+                                        if event.up.click_count == 2 {
+                                            window.dispatch_action(
+                                                this.double_click_dispatch_action.boxed_clone(),
+                                                cx,
+                                            );
+                                        }
+                                    },
+                                ));
                             if has_worktrees {
                                 placeholder
                             } else {

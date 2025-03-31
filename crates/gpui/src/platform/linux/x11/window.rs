@@ -353,7 +353,6 @@ where
 }
 
 impl X11WindowState {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         handle: AnyWindowHandle,
         client: X11ClientStatePtr,
@@ -712,7 +711,6 @@ enum WmHintPropertyState {
 }
 
 impl X11Window {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         handle: AnyWindowHandle,
         client: X11ClientStatePtr,
@@ -1143,6 +1141,30 @@ impl PlatformWindow for X11Window {
         state
             .content_size()
             .map(|size| size.div(state.scale_factor))
+    }
+
+    fn resize(&mut self, size: Size<Pixels>) {
+        let state = self.0.state.borrow();
+        let size = size.to_device_pixels(state.scale_factor);
+        let width = size.width.0 as u32;
+        let height = size.height.0 as u32;
+
+        check_reply(
+            || {
+                format!(
+                    "X11 ConfigureWindow failed. width: {}, height: {}",
+                    width, height
+                )
+            },
+            self.0.xcb.configure_window(
+                self.0.x_window,
+                &xproto::ConfigureWindowAux::new()
+                    .width(width)
+                    .height(height),
+            ),
+        )
+        .log_err();
+        self.flush().log_err();
     }
 
     fn scale_factor(&self) -> f32 {

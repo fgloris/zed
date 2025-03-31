@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
     env_logger::init();
 
     let args = Args::parse();
-    let fs = Arc::new(RealFs::default());
+    let fs = Arc::new(RealFs::new(None, gpui::background_executor()));
     let engine = wasmtime::Engine::default();
     let mut wasm_store = WasmStore::new(&engine)?;
 
@@ -339,6 +339,20 @@ async fn test_themes(
         let theme_path = extension_path.join(relative_theme_path);
         let theme_family = theme::read_user_theme(&theme_path, fs.clone()).await?;
         log::info!("loaded theme family {}", theme_family.name);
+
+        for theme in &theme_family.themes {
+            if theme
+                .style
+                .colors
+                .deprecated_scrollbar_thumb_background
+                .is_some()
+            {
+                bail!(
+                    r#"Theme "{theme_name}" is using a deprecated style property: scrollbar_thumb.background. Use `scrollbar.thumb.background` instead."#,
+                    theme_name = theme.name
+                )
+            }
+        }
     }
 
     Ok(())

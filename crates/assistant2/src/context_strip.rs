@@ -4,15 +4,15 @@ use collections::HashSet;
 use editor::Editor;
 use file_icons::FileIcons;
 use gpui::{
-    App, Bounds, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Subscription,
-    WeakEntity,
+    App, Bounds, ClickEvent, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    Subscription, WeakEntity,
 };
 use itertools::Itertools;
 use language::Buffer;
 use ui::{prelude::*, KeyBinding, PopoverMenu, PopoverMenuHandle, Tooltip};
 use workspace::{notifications::NotifyResultExt, Workspace};
 
-use crate::context::ContextKind;
+use crate::context::{ContextId, ContextKind};
 use crate::context_picker::{ConfirmBehavior, ContextPicker};
 use crate::context_store::ContextStore;
 use crate::thread::Thread;
@@ -25,7 +25,7 @@ use crate::{
 
 pub struct ContextStrip {
     context_store: Entity<ContextStore>,
-    pub context_picker: Entity<ContextPicker>,
+    context_picker: Entity<ContextPicker>,
     context_picker_menu_handle: PopoverMenuHandle<ContextPicker>,
     focus_handle: FocusHandle,
     suggest_context_kind: SuggestContextKind,
@@ -36,11 +36,9 @@ pub struct ContextStrip {
 }
 
 impl ContextStrip {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         context_store: Entity<ContextStore>,
         workspace: WeakEntity<Workspace>,
-        editor: WeakEntity<Editor>,
         thread_store: Option<WeakEntity<ThreadStore>>,
         context_picker_menu_handle: PopoverMenuHandle<ContextPicker>,
         suggest_context_kind: SuggestContextKind,
@@ -52,7 +50,6 @@ impl ContextStrip {
                 workspace.clone(),
                 thread_store.clone(),
                 context_store.downgrade(),
-                editor.clone(),
                 ConfirmBehavior::KeepOpen,
                 window,
                 cx,
@@ -280,6 +277,14 @@ impl ContextStrip {
         best.map(|(index, _, _)| index)
     }
 
+    fn open_context(&mut self, id: ContextId, window: &mut Window, cx: &mut App) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+
+        crate::active_thread::open_context(id, self.context_store.clone(), workspace, window, cx);
+    }
+
     fn remove_focused_context(
         &mut self,
         _: &RemoveFocusedContext,
@@ -336,12 +341,12 @@ impl ContextStrip {
             context_store.accept_suggested_context(&suggested, cx)
         });
 
-        cx.spawn_in(window, |this, mut cx| async move {
-            match task.await.notify_async_err(&mut cx) {
+        cx.spawn_in(window, async move |this, cx| {
+            match task.await.notify_async_err(cx) {
                 None => {}
                 Some(()) => {
                     if let Some(this) = this.upgrade() {
-                        this.update(&mut cx, |_, cx| cx.notify())?;
+                        this.update(cx, |_, cx| cx.notify())?;
                     }
                 }
             }
@@ -461,6 +466,7 @@ impl Render for ContextStrip {
                 }
             })
             .children(context.iter().enumerate().map(|(i, context)| {
+                let id = context.id;
                 ContextPill::added(
                     context.clone(),
                     dupe_names.contains(&context.name),
@@ -476,10 +482,16 @@ impl Render for ContextStrip {
                         }))
                     }),
                 )
-                .on_click(Rc::new(cx.listener(move |this, _, _window, cx| {
-                    this.focused_index = Some(i);
-                    cx.notify();
-                })))
+                .on_click(Rc::new(cx.listener(
+                    move |this, event: &ClickEvent, window, cx| {
+                        if event.down.click_count > 1 {
+                            this.open_context(id, window, cx);
+                        } else {
+                            this.focused_index = Some(i);
+                        }
+                        cx.notify();
+                    },
+                )))
             }))
             .when_some(suggested_context, |el, suggested| {
                 el.child(
